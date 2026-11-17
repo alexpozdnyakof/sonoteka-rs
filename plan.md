@@ -1,0 +1,53 @@
+# sonoteka-rs — план разработки
+
+## Контекст стенда (чтобы не вспоминать)
+
+- Сервер: MacBook Pro (Intel, macOS 15.7.3), `~/sonoteka/`, launchd-агент `ru.sonoteka.rs`, лог `~/sonoteka/server.log`.
+- Библиотека: `/Volumes/Macintosh HD 1/music` — 413 треков / 57 альбомов, внешний HDD.
+- Деплой с MBA: `./deploy.sh` (кросс-сборка x86_64 → scp → launchctl kickstart → ждёт свежий `listening`).
+- Доступ клиентов: дома — LAN `http://192.168.88.137:4533` (быстро), вне дома — меш `http://100.64.0.5:4533`.
+- Auth: пользователь `admin`, пароль в `~/sonoteka/sonoteka.env`.
+- ID = md5 от ключа (путь/имя): стабильны между ресcанами, ломаются при ретеге/переносе (ledger — в фазе 3).
+
+## Сделано
+
+- [x] Скелет: сканер тегов (lofty), SQLite, авторизация md5+sha256, stream с HTTP Range, браузинг библиотеки
+- [x] Обложки: извлечение встроенных + диск-кэш
+- [x] Feishin-дожим: getScanStatus, getSimilarSongs2, getTopSongs, getOpenSubsonicExtensions (анонимно)
+- [x] Инфра: launchd + start.sh (ожидание тома) + deploy.sh
+- [x] Лог запросов `[req]` в server.log
+- [x] **Жанры**: скан → колонка `tracks.genre`, getGenres, getSongsByGenre, byGenre в getAlbumList/getAlbumList2. Деплой проверен curl'ом на сервере (413 треков, 17 жанров). Примечание: sonoteka.env не содержит SONOTEKA_USER — юзер всегда дефолтный `admin`.
+- [x] **Плейлисты**: полный CRUD (getPlaylists/getPlaylist/createPlaylist/updatePlaylist/deletePlaylist), повторяющиеся параметры (songId/songIdToAdd/songIndexToRemove) через `Query<Vec<(String,String)>>` + опциональный form-body (кастомный `MaybeForm` — у axum 0.8 нет `Option<Form>`), GET и POST. Импорт .m3u/.m3u8 при ресане: id плейлиста = stable_id относительного пути файла, реимпорт обновляет в-place, владелец из SONOTEKA_USER. В библиотеке уже нашлось 5 m3u — подхватились автоматически. Проверено curl'ом: CRUD, POST-form, пережитие рескана.
+
+## Фаза 1 — ядро
+
+- [ ] **Scrobble → БД**: play_count / played_at; после этого честные getTopSongs
+- [ ] **Ресайз обложек** ~500px (crate `image`), сейчас отдаются как есть
+- [ ] **Ручной rescan**: `/rest/scan` без рестарта процесса
+
+## Фаза 2 — радио
+
+- [ ] **Движок правил** `radio/` — общий генератор очередей (правило → список треков): сид, жанр/артист/эра, веса, антиповторы. Используется и умными плейлистами, и эфиром.
+- [ ] **Умные плейлисты**: правила + автообновление = портативное радио в любом Subsonic-клиенте
+- [ ] **Решение по эфиру** `/radio`: непрерывный Opus-стрим (ffmpeg-конвейер, общая очередь, ICY-метаданные) — после умных плейлистов, когда правила готовы
+- [ ] InternetRadioStations CRUD (закладки на внешние станции) — низкий приоритет
+
+## Фаза 3 — совместимость и качество
+
+- [ ] XML-конверт ответов (legacy-клиенты без JSON)
+- [ ] apiKey auth + constant-time сравнение токенов
+- [ ] Snapshot-тесты конвертов (insta) — регрессии ловятся сами
+- [ ] Identity ledger: ID не портятся при ретеге/переносе (долговечность плейлистов)
+- [ ] Мульти-библиотека: несколько `SONOTEKA_MUSIC_FOLDER`
+- [ ] Сортировка: `768 ...` сейчас всплывает наверх — натуральная сортировка для цифровых префиксов
+- [ ] Нормализация регистра жанров: `Electronic`/`electronic`/`Electro`/`electro` сейчас разные строки (17 жанров вместо ~10)
+
+## Фаза 4 — расширения
+
+- [ ] Транскодинг ffmpeg (Opus для мобильного интернета)
+- [ ] Скробблинг наружу: ListenBrainz / Last.fm
+- [ ] Gapless/кроссфейд в эфире (ffmpeg acrossfile)
+
+## Внешние блокеры
+
+- [ ] awg-туннель ~10 КБ/с между пирами — расследование запущено у агента awg. Меш-стриминг и «эфир вне дома» ждут его результата.
