@@ -6,7 +6,7 @@ use lofty::tag::{Accessor, ItemKey};
 use rusqlite::Connection;
 use walkdir::WalkDir;
 
-use crate::db;
+use crate::{db, radio};
 
 const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "ogg", "opus", "m4a", "aac", "wav"];
 
@@ -57,9 +57,23 @@ pub fn rescan(conn: &mut Connection, music_folder: &Path, owner: &str) -> Result
     if imported > 0 {
         eprintln!("m3u import: {imported} playlist(s)");
     }
+    let smart = regenerate_smart_playlists(conn, now)?;
+    if smart > 0 {
+        eprintln!("smart playlists regenerated: {smart}");
+    }
     db::prune_orphan_playlist_tracks(conn)?;
     eprintln!("library scan complete: {count} tracks");
     Ok(())
+}
+
+fn regenerate_smart_playlists(conn: &mut Connection, now: i64) -> Result<usize> {
+    let smart = db::smart_playlists(conn)?;
+    for (id, raw) in &smart {
+        if let Err(e) = radio::regenerate(conn, id, raw, now) {
+            eprintln!("smart playlist {id}: {e:#}");
+        }
+    }
+    Ok(smart.len())
 }
 
 /// Sidecar playlists: every `.m3u`/`.m3u8` in the library becomes a playlist

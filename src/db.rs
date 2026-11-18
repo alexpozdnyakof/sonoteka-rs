@@ -35,6 +35,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             bit_rate     INTEGER,
             sample_rate  INTEGER,
             genre        TEXT,
+            play_count   INTEGER NOT NULL DEFAULT 0,
+            played_at    INTEGER,
             has_art      INTEGER NOT NULL DEFAULT 0
         );
 
@@ -45,7 +47,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             owner      TEXT NOT NULL,
             public     INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0,
-            changed_at INTEGER NOT NULL DEFAULT 0
+            changed_at INTEGER NOT NULL DEFAULT 0,
+            rules      TEXT
         );
 
         CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -76,6 +79,16 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if !playlist_cols.iter().any(|c| c == "changed_at") {
         conn.execute_batch("ALTER TABLE playlists ADD COLUMN changed_at INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !playlist_cols.iter().any(|c| c == "rules") {
+        conn.execute_batch("ALTER TABLE playlists ADD COLUMN rules TEXT;")?;
+    }
+    let track_cols = table_columns(conn, "tracks")?;
+    if !track_cols.iter().any(|c| c == "play_count") {
+        conn.execute_batch("ALTER TABLE tracks ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !track_cols.iter().any(|c| c == "played_at") {
+        conn.execute_batch("ALTER TABLE tracks ADD COLUMN played_at INTEGER;")?;
     }
     Ok(())
 }
@@ -278,23 +291,27 @@ pub struct TrackRow {
     pub content_type: String,
     pub bit_rate: Option<i64>,
     pub genre: Option<String>,
+    pub play_count: i64,
+    /// Selected for SQL-side ordering (top songs, anti-repeat); no wire field.
+    #[allow(dead_code)]
+    pub played_at: Option<i64>,
     pub has_art: bool,
 }
 
-const TRACK_COLS: &str =
+pub(crate) const TRACK_COLS: &str =
     "t.id, t.path, t.title, t.album_id, al.name, t.artist_id, ar.name,
      t.track_number, t.disc_number, t.duration, t.size, t.suffix,
-     t.content_type, t.bit_rate, t.genre, t.has_art";
+     t.content_type, t.bit_rate, t.genre, t.play_count, t.played_at, t.has_art";
 
 const TRACK_SELECT: &str =
     "SELECT t.id, t.path, t.title, t.album_id, al.name, t.artist_id, ar.name,
             t.track_number, t.disc_number, t.duration, t.size, t.suffix,
-            t.content_type, t.bit_rate, t.genre, t.has_art
+            t.content_type, t.bit_rate, t.genre, t.play_count, t.played_at, t.has_art
      FROM tracks t
      JOIN albums al ON al.id = t.album_id
      JOIN artists ar ON ar.id = t.artist_id";
 
-fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
+pub(crate) fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
     Ok(TrackRow {
         id: row.get(0)?,
         path: row.get(1)?,
@@ -311,7 +328,9 @@ fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrackRow> {
         content_type: row.get(12)?,
         bit_rate: row.get(13)?,
         genre: row.get(14)?,
-        has_art: row.get::<_, i64>(15)? != 0,
+        play_count: row.get(15)?,
+        played_at: row.get(16)?,
+        has_art: row.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -433,16 +452,29 @@ pub fn track_count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?)
 }
 
+/// "Top" = most played, ties broken by most recently played. Tracks never
+/// scrobbled keep play_count 0 and sink below everything played.
 pub fn songs_by_artist(conn: &Connection, artist_id: &str, limit: i64) -> Result<Vec<TrackRow>> {
     let sql = format!(
         "{TRACK_SELECT} WHERE t.artist_id = ?1
-         ORDER BY al.name COLLATE NOCASE, t.path LIMIT ?2"
+         ORDER BY t.play_count DESC, COALESCE(t.played_at, 0) DESC,
+                  al.name COLLATE NOCASE, t.path LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![artist_id, limit], track_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Scrobble bookkeeping: bump the counter, stamp the last-played time.
+/// Returns false when the id is not a known track.
+pub fn record_play(conn: &Connection, id: &str, played_at: i64) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE tracks SET play_count = play_count + 1, played_at = ?2 WHERE id = ?1",
+        params![id, played_at],
+    )?;
+    Ok(affected > 0)
 }
 
 pub struct GenreRow {
@@ -737,6 +769,28 @@ pub fn track_ids_for_paths(conn: &Connection, paths: &[String]) -> Result<Vec<(S
         .query_map(rusqlite::params_from_iter(paths.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Rules for smart playlists (JSON, see radio::Rules). Empty string clears.
+pub fn set_playlist_rules(
+    conn: &Connection,
+    id: &str,
+    rules: Option<&str>,
+    now: i64,
+) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE playlists SET rules = ?2, changed_at = ?3 WHERE id = ?1",
+        params![id, rules, now],
+    )?;
+    Ok(affected > 0)
+}
+
+/// (id, raw rules) for every playlist carrying rules — the regen sweep.
+pub fn smart_playlists(conn: &Connection) -> Result<Vec<(String, String)>> {
+    Ok(conn
+        .prepare("SELECT id, rules FROM playlists WHERE rules IS NOT NULL AND rules != ''")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 

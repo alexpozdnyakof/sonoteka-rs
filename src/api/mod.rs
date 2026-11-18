@@ -91,6 +91,13 @@ async fn dispatch(
         "getSong" => subsonic::get_song(&state, &params),
         "search3" => subsonic::search3(&state, &params),
         "getScanStatus" => subsonic::get_scan_status(&state),
+        "scan" | "startScan" => {
+            let st = state.clone();
+            match tokio::task::spawn_blocking(move || subsonic::start_scan(st)).await {
+                Ok(resp) => resp,
+                Err(e) => subsonic::error(0, &format!("scan task failed to run: {e}")),
+            }
+        }
         "getSimilarSongs2" => subsonic::get_similar_songs2(&state, &params),
         "getTopSongs" => subsonic::get_top_songs(&state, &params),
         "getStarred" | "getStarred2" => {
@@ -114,7 +121,7 @@ async fn dispatch(
         "stream" | "download" => {
             crate::stream::stream(state, &params, range).await
         }
-        "scrobble" => subsonic::ok(json!({})),
+        "scrobble" => subsonic::scrobble(&state, &params, &multi),
         other => {
             eprintln!("[req] {other} -> not implemented");
             subsonic::error(70, &format!("method not implemented: {other}"))

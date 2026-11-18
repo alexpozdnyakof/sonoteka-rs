@@ -6,7 +6,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::{AppState, db};
+use crate::{AppState, db, radio};
 
 pub const API_VERSION: &str = "1.16.1";
 pub const IGNORED_ARTICLES: &str = "The El La Los Las Le Les Os As O A";
@@ -330,7 +330,18 @@ pub fn create_playlist(
                 Ok(p) => p,
                 Err(e) => return error(0, &format!("database error: {e:#}")),
             };
-            if let Err(e) =
+            if let Some(raw) = params.get("rules").filter(|r| !r.trim().is_empty()) {
+                if let Err(e) = radio::Rules::parse(raw) {
+                    return error(10, &format!("invalid rules: {e:#}"));
+                }
+                let result = with_db(state, |c| {
+                    db::set_playlist_rules(c, &playlist.id, Some(raw), now)?;
+                    radio::regenerate(c, &playlist.id, raw, now)
+                });
+                if let Err(e) = result {
+                    return error(0, &format!("database error: {e:#}"));
+                }
+            } else if let Err(e) =
                 with_db(state, |c| db::set_playlist_entries(c, &playlist.id, &song_ids, now))
             {
                 return error(0, &format!("database error: {e:#}"));
@@ -398,6 +409,60 @@ pub fn update_playlist(
             Ok(true) => {}
             Ok(false) => return error(70, &format!("playlist not found: {id}")),
             Err(e) => return error(0, &format!("database error: {e:#}")),
+        }
+    }
+    // `rules` present + non-empty → save and apply; present + empty → clear.
+    if let Some(raw) = params.get("rules") {
+        let rules = if raw.trim().is_empty() { None } else { Some(raw) };
+        if let Some(raw) = rules
+            && let Err(e) = radio::Rules::parse(raw)
+        {
+            return error(10, &format!("invalid rules: {e:#}"));
+        }
+        let result = with_db(state, |c| {
+            db::set_playlist_rules(c, id, rules.map(String::as_str), now)?;
+            if let Some(raw) = rules {
+                radio::regenerate(c, id, raw, now)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        if let Err(e) = result {
+            return error(0, &format!("database error: {e:#}"));
+        }
+    }
+    ok(json!({}))
+}
+
+/// Scrobble submissions write play_count/played_at; `submission=false`
+/// ("now playing") pings are acknowledged but not counted.
+pub fn scrobble(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    multi: &HashMap<String, Vec<String>>,
+) -> Response {
+    let ids: Vec<&str> = multi
+        .get("id")
+        .map(|v| v.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return error(10, "missing required parameter: id");
+    }
+    let count_plays = params
+        .get("submission")
+        .and_then(|v| parse_bool(v))
+        .unwrap_or(true);
+    let played_at = params
+        .get("time")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|ms| ms / 1000)
+        .unwrap_or_else(now_secs);
+    if count_plays {
+        for id in &ids {
+            match with_db(state, |c| db::record_play(c, id, played_at)) {
+                Ok(true) => {}
+                Ok(false) => return error(70, &format!("song not found: {id}")),
+                Err(e) => return error(0, &format!("database error: {e:#}")),
+            }
         }
     }
     ok(json!({}))
@@ -649,6 +714,7 @@ fn child_json(t: &db::TrackRow) -> Value {
         "duration": t.duration.round() as i64,
         "bitRate": t.bit_rate,
         "genre": t.genre,
+        "playCount": t.play_count,
         "path": t.path,
         "type": "music",
     })
@@ -679,7 +745,39 @@ pub fn get_scan_status(state: &AppState) -> Response {
         Ok(n) => n,
         Err(e) => return error(0, &format!("database error: {e:#}")),
     };
-    ok(json!({ "scanStatus": { "scanning": false, "count": count } }))
+    let scanning = state.scanning.load(std::sync::atomic::Ordering::Relaxed);
+    ok(json!({ "scanStatus": { "scanning": scanning, "count": count } }))
+}
+
+/// Manual rescan without a process restart; runs off the async runtime so
+/// the event loop stays responsive. Concurrent calls collapse into the
+/// in-flight scan (the flag flip acts as a cheap lock).
+pub fn start_scan(state: AppState) -> Response {
+    if state
+        .scanning
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return get_scan_status(&state);
+    }
+    let result = {
+        let mut conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                state
+                    .scanning
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return error(0, &format!("database lock poisoned: {e}"));
+            }
+        };
+        crate::scan::rescan(&mut conn, &state.music_folder, &state.user)
+    };
+    state
+        .scanning
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    match result {
+        Ok(()) => get_scan_status(&state),
+        Err(e) => error(0, &format!("scan failed: {e:#}")),
+    }
 }
 
 /// Personal-server honesty: without an MBID/similarity backend, "similar"
@@ -702,7 +800,7 @@ pub fn get_similar_songs2(state: &AppState, params: &HashMap<String, String>) ->
     ok(json!({ "similarSongs2": { "song": songs.iter().map(child_json).collect::<Vec<_>>() } }))
 }
 
-/// No play counts yet, so "top" is the artist's tracks in album order.
+/// Top = most scrobbled (play_count, freshest first as tiebreak).
 pub fn get_top_songs(state: &AppState, params: &HashMap<String, String>) -> Response {
     let artist_id = match params.get("id").or_else(|| params.get("artistId")) {
         Some(i) => i.clone(),

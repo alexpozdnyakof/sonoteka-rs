@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod radio;
 mod scan;
 mod stream;
 
@@ -14,8 +15,10 @@ use rusqlite::Connection;
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub cache_dir: PathBuf,
+    pub music_folder: PathBuf,
     pub user: String,
     pub password: String,
+    pub scanning: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -48,8 +51,10 @@ async fn main() -> Result<()> {
     let state = AppState {
         db: Arc::new(Mutex::new(conn)),
         cache_dir,
+        music_folder: music_folder.clone(),
         user,
         password,
+        scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let addr: SocketAddr = format!("{address}:{port}")
