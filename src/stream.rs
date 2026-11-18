@@ -1,7 +1,7 @@
 //! `stream` serves audio files with correct HTTP Range handling (seeking in
-//! clients depends on it); `getCoverArt` extracts embedded artwork and caches
-//! it on disk. Transcoding is deliberately out of scope — FLAC is served
-//! as-is.
+//! clients depends on it); `getCoverArt` extracts embedded artwork, shrinks it
+//! to a ~500px thumbnail and caches it on disk. Transcoding is deliberately
+//! out of scope — FLAC is served as-is.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,13 +57,12 @@ pub async fn cover_art(state: AppState, params: &HashMap<String, String>) -> Res
         Err(e) => return subsonic::error(0, &format!("database error: {e:#}")),
     };
     match extract_art(Path::new(&source)) {
-        Ok(Some((mime, bytes))) => {
-            let ext = ext_for_mime(&mime);
-            let cache_path = state.cache_dir.join(art_name(id, ext));
+        Ok(Some(bytes)) => {
+            let cache_path = state.cache_dir.join(art_name(id));
             if let Err(e) = tokio::fs::write(&cache_path, &bytes).await {
                 eprintln!("cover art cache write {}: {e}", cache_path.display());
             }
-            art_response(&mime, bytes)
+            art_response(bytes)
         }
         Ok(None) => subsonic::error(70, "no cover art"),
         Err(e) => subsonic::error(0, &format!("cover art extraction failed: {e:#}")),
@@ -151,7 +150,7 @@ fn parse_range(header_val: Option<&str>, len: u64) -> Result<(u64, u64, bool), R
     Ok((start, end.max(start), true))
 }
 
-fn extract_art(path: &Path) -> Result<Option<(String, Vec<u8>)>> {
+fn extract_art(path: &Path) -> Result<Option<Vec<u8>>> {
     let tagged = lofty::read_from_path(path).context("read tags")?;
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(None);
@@ -159,15 +158,32 @@ fn extract_art(path: &Path) -> Result<Option<(String, Vec<u8>)>> {
     let Some(pic) = tag.pictures().first() else {
         return Ok(None);
     };
-    let mime = pic
-        .mime_type()
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| "image/jpeg".to_string());
-    Ok(Some((mime, pic.data().to_vec())))
+    Ok(Some(thumbnail(pic.data())))
+}
+
+/// Embedded art is regularly 1400x1400+; clients only need a thumbnail.
+/// Undecodable payloads pass through untouched (they are rare and still
+/// better than no art at all).
+fn thumbnail(data: &[u8]) -> Vec<u8> {
+    let Ok(img) = image::load_from_memory(data) else {
+        return data.to_vec();
+    };
+    let thumb = image::imageops::thumbnail(&img, 500, 500);
+    let mut out = Vec::new();
+    {
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+        if enc.encode_image(&thumb).is_err() {
+            return data.to_vec();
+        }
+    }
+    if out.is_empty() {
+        return data.to_vec();
+    }
+    out
 }
 
 async fn serve_cached_art(cache_dir: &Path, id: &str) -> Option<Response> {
-    let prefix = format!("art-{id}.");
+    let prefix = art_name(id);
     let mut entries = tokio::fs::read_dir(cache_dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -175,35 +191,17 @@ async fn serve_cached_art(cache_dir: &Path, id: &str) -> Option<Response> {
             continue;
         }
         let bytes = tokio::fs::read(entry.path()).await.ok()?;
-        let ext = name.rsplit('.').next().unwrap_or("jpg");
-        let mime = mime_for_ext(ext);
-        return Some(art_response(mime, bytes));
+        return Some(art_response(bytes));
     }
     None
 }
 
-fn art_name(id: &str, ext: &str) -> String {
-    format!("art-{id}.{ext}")
+/// Versioned cache name: the "-500" scheme keeps pre-resize full-size files
+/// from being served (they just sit there harmlessly).
+fn art_name(id: &str) -> String {
+    format!("art-{id}-500.")
 }
 
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => "jpg",
-    }
-}
-
-fn mime_for_ext(ext: &str) -> &'static str {
-    match ext {
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        _ => "image/jpeg",
-    }
-}
-
-fn art_response(mime: &str, bytes: Vec<u8>) -> Response {
-    ([(header::CONTENT_TYPE, mime)], bytes).into_response()
+fn art_response(bytes: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response()
 }
