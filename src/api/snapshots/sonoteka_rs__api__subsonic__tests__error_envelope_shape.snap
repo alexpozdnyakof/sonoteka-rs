@@ -1,0 +1,14 @@
+---
+source: src/api/subsonic.rs
+expression: snap(&body)
+---
+{
+  "subsonic-response": {
+    "error": {
+      "code": 70,
+      "message": "song not found: x"
+    },
+    "status": "failed",
+    "version": "1.16.1"
+  }
+}

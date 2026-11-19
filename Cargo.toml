@@ -18,3 +18,7 @@ tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "f
 tokio-util = { version = "0.7.20", features = ["io"] }
 walkdir = "2.5.0"
 async-stream = "0.3.6"
+
+[dev-dependencies]
+insta = "1.42"
+http-body-util = "0.1"

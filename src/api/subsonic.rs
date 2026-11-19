@@ -836,3 +836,111 @@ pub fn error(code: i32, message: &str) -> Response {
     }))
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn track() -> db::TrackRow {
+        db::TrackRow {
+            id: "track-1".into(),
+            path: "/music/Artist/Album/03 Song.flac".into(),
+            title: "Song".into(),
+            album_id: "album-1".into(),
+            album_name: "Album".into(),
+            artist_id: "artist-1".into(),
+            artist_name: "Artist".into(),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration: 245.4,
+            size: 18_000_000,
+            suffix: "flac".into(),
+            content_type: "audio/flac".into(),
+            bit_rate: Some(900),
+            genre: Some("Techno".into()),
+            play_count: 7,
+            played_at: Some(1_700_000_000),
+            has_art: true,
+        }
+    }
+
+    fn album() -> db::AlbumRow {
+        db::AlbumRow {
+            id: "album-1".into(),
+            name: "Album".into(),
+            artist_id: "artist-1".into(),
+            artist_name: "Artist".into(),
+            year: Some(1998),
+            song_count: 12,
+            duration: 3_300.6,
+            added_at: 1_700_000_000,
+        }
+    }
+
+    fn playlist() -> db::PlaylistRow {
+        db::PlaylistRow {
+            id: "playlist-1".into(),
+            name: "Mix".into(),
+            comment: "test".into(),
+            owner: "admin".into(),
+            public: true,
+            created_at: 1_700_000_000,
+            changed_at: 1_700_000_100,
+            song_count: 1,
+            duration: 245.4,
+        }
+    }
+
+    fn snap(v: &Value) -> String {
+        serde_json::to_string_pretty(v).unwrap()
+    }
+
+    // These pin the wire shapes Subsonic clients consume: a renamed field,
+    // a dropped key or an int/string flip fails the snapshot.
+
+    #[test]
+    fn child_entry_shape() {
+        insta::assert_snapshot!(snap(&child_json(&track())));
+    }
+
+    #[test]
+    fn album_shape() {
+        insta::assert_snapshot!(snap(&album_json(&album())));
+    }
+
+    #[test]
+    fn legacy_album_directory_shape() {
+        insta::assert_snapshot!(snap(&album_dir_json(&album())));
+    }
+
+    #[test]
+    fn playlist_with_entries_shape() {
+        let entries = vec![track()];
+        insta::assert_snapshot!(snap(&playlist_json(&playlist(), Some(&entries))));
+    }
+
+    #[test]
+    fn ok_envelope_wraps_body() {
+        let resp = ok(json!({ "ping": {} }));
+        let body = resp_to_json(resp);
+        insta::assert_snapshot!(snap(&body));
+    }
+
+    #[test]
+    fn error_envelope_shape() {
+        let resp = error(70, "song not found: x");
+        let body = resp_to_json(resp);
+        insta::assert_snapshot!(snap(&body));
+    }
+
+    fn resp_to_json(resp: Response) -> Value {
+        use http_body_util::BodyExt;
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}

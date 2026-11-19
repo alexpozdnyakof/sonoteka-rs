@@ -1,0 +1,15 @@
+---
+source: src/api/subsonic.rs
+expression: snap(&album_json(&album()))
+---
+{
+  "artist": "Artist",
+  "artistId": "artist-1",
+  "coverArt": "album-1",
+  "created": "2023-11-14T22:13:20Z",
+  "duration": 3301,
+  "id": "album-1",
+  "name": "Album",
+  "songCount": 12,
+  "year": 1998
+}
