@@ -16,21 +16,20 @@
 - [x] Feishin-дожим: getScanStatus, getSimilarSongs2, getTopSongs, getOpenSubsonicExtensions (анонимно)
 - [x] Инфра: launchd + start.sh (ожидание тома) + deploy.sh
 - [x] Лог запросов `[req]` в server.log
-- [x] **Жанры**: скан → колонка `tracks.genre`, getGenres, getSongsByGenre, byGenre в getAlbumList/getAlbumList2. Деплой проверен curl'ом на сервере (413 треков, 17 жанров). Примечание: sonoteka.env не содержит SONOTEKA_USER — юзер всегда дефолтный `admin`.
-- [x] **Плейлисты**: полный CRUD (getPlaylists/getPlaylist/createPlaylist/updatePlaylist/deletePlaylist), повторяющиеся параметры (songId/songIdToAdd/songIndexToRemove) через `Query<Vec<(String,String)>>` + опциональный form-body (кастомный `MaybeForm` — у axum 0.8 нет `Option<Form>`), GET и POST. Импорт .m3u/.m3u8 при ресане: id плейлиста = stable_id относительного пути файла, реимпорт обновляет в-place, владелец из SONOTEKA_USER. В библиотеке уже нашлось 5 m3u — подхватились автоматически. Проверено curl'ом: CRUD, POST-form, пережитие рескана.
+- [x] **Жанры**: getGenres, getSongsByGenre, byGenre в getAlbumList/getAlbumList2
+- [x] **Плейлисты**: полный CRUD + импорт .m3u/.m3u8 (id от пути файла, реимпорт in-place). В библиотеке 5 m3u — подхватились сами
+- [x] **Scrobble → БД**: play_count/played_at из scrobble, playCount в child, честные getTopSongs
+- [x] **Обложки 500px**: ресайз через crate image (jpeg q85), кэш `art-<id>-500.`
+- [x] **Ручной rescan**: `/rest/scan` + `startScan` без рестарта, флаг scanning в getScanStatus
+- [x] **Движок правил** `radio/`: JSON-правила (жанры, артисты, эра, порядок random/newest/top, exclude_recent_days)
+- [x] **Умные плейлисты**: rules в колонке playlists.rules, автообновление при скане и при смене правил
+- [x] **Эфир** `/radio`: общая очередь → broadcast, ffmpeg `-re` (realtime) в Opus 96k Ogg; ICY StreamTitle только по `Icy-MetaData: 1`, иначе чистый Ogg. Параметры очереди `?genres=..&order=..&limit=..&exclude_recent_days=..`. ffmpeg 6.1.1 статикой в `~/sonoteka/ffmpeg`, путь через `SONOTEKA_FFMPEG`
+- [x] **TCC-лаунчер**: стабильный бинарь `sonoteka-rs-launcher` (не меняется между деплоями) exec'ит `sonoteka-server` — разрешение «Съёмные тома» выдано один раз и переживает редеплои
 
-## Фаза 1 — ядро
+## Фаза 2 — радио (остаток)
 
-- [ ] **Scrobble → БД**: play_count / played_at; после этого честные getTopSongs
-- [ ] **Ресайз обложек** ~500px (crate `image`), сейчас отдаются как есть
-- [ ] **Ручной rescan**: `/rest/scan` без рестарта процесса
-
-## Фаза 2 — радио
-
-- [ ] **Движок правил** `radio/` — общий генератор очередей (правило → список треков): сид, жанр/артист/эра, веса, антиповторы. Используется и умными плейлистами, и эфиром.
-- [ ] **Умные плейлисты**: правила + автообновление = портативное радио в любом Subsonic-клиенте
-- [ ] **Решение по эфиру** `/radio`: непрерывный Opus-стрим (ffmpeg-конвейер, общая очередь, ICY-метаданные) — после умных плейлистов, когда правила готовы
 - [ ] InternetRadioStations CRUD (закладки на внешние станции) — низкий приоритет
+- [ ] Gapless между треками в эфире (ffmpeg acrossfile — сейчас маленькая пауза на стыках)
 
 ## Фаза 3 — совместимость и качество
 
@@ -51,4 +50,4 @@
 ## Внешние блокеры
 
 - [ ] awg-туннель ~10 КБ/с между пирами — расследование запущено у агента awg. Меш-стриминг и «эфир вне дома» ждут его результата.
-- [ ] **macOS TCC и деплой**: каждый деплой меняет ad-hoc подпись бинаря → macOS видит «новое приложение» → доступ к съёмному тому (`/Volumes/...`) блокируется до разрешения (open() виснет, сервер стоит в скане). Симптом: в логе нет свежего `library scan complete`, процесс жив, сокетов нет. Лечение: клик «Разрешить» на экране MacBook / Системные настройки → Съёмные тома. Кандидаты в постоянное решение: Full Disk Access для стабильного враппера, подписание бинаря стабильным сертификатом.
+- [x] **macOS TCC и деплой** — РЕШЕНО лаунчером (см. «Сделано»). Симптом был: после деплоя нет свежего `library scan complete`, процесс жив, сокетов нет, main-thread в `open()`. Если вернётся — смотреть ответственный процесс через `sample`.
