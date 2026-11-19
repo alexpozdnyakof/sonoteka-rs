@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         // Playlist mutations arrive as POST on some clients; params travel in
         // the query string either way (an optional form body is merged too).
         .route("/rest/{*method}", get(dispatch).post(dispatch))
+        .route("/radio", get(crate::radio::stream_handler))
         .with_state(state)
 }
 

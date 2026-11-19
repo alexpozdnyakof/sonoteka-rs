@@ -13,11 +13,23 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+
 use anyhow::{Context, Result};
+use axum::{
+    body::Body,
+    extract::{Query, State},
+    http::{HeaderMap, HeaderValue, header},
+    response::{IntoResponse, Response},
+};
 use rusqlite::{Connection, ToSql};
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio::sync::broadcast;
 
-use crate::db;
+use crate::{AppState, db};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Order {
@@ -138,4 +150,268 @@ pub fn regenerate(conn: &Connection, playlist_id: &str, raw: &str, now: i64) -> 
     let tracks = tracks_by_rules(conn, &rules, now)?;
     let ids = tracks.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
     db::set_playlist_entries(conn, playlist_id, &ids, now)
+}
+
+// ---------------------------------------------------------------------------
+// Live radio: one shared queue broadcast to every listener as a continuous
+// Opus-in-Ogg stream. ffmpeg transcodes track by track (gapless across
+// tracks is a phase-4 item); ICY metadata is interleaved only for clients
+// that ask for it (`Icy-MetaData: 1`), so browsers get a pure Ogg stream.
+// ---------------------------------------------------------------------------
+
+/// Audio bytes between ICY metadata blocks.
+pub const METAINT: usize = 16 * 1024;
+
+#[derive(Clone, Default)]
+pub struct NowPlaying {
+    pub title: String,
+    pub artist: String,
+}
+
+#[derive(Clone)]
+pub struct RadioState {
+    pub tx: broadcast::Sender<Vec<u8>>,
+    pub now: Arc<StdMutex<NowPlaying>>,
+    pub listeners: Arc<AtomicUsize>,
+    pub engine_on: Arc<AtomicBool>,
+}
+
+impl RadioState {
+    pub fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(1024);
+        RadioState {
+            tx,
+            now: Arc::new(StdMutex::new(NowPlaying::default())),
+            listeners: Arc::new(AtomicUsize::new(0)),
+            engine_on: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Decrements the listener counter when a stream ends (client disconnect).
+struct ListenerGuard(Arc<AtomicUsize>);
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Shared state for the HTTP handler: joins the broadcast, starts the engine
+/// when the first listener arrives. Query params seed the queue rules the
+/// first time (`?genres=Techno,Ambient&order=top`); later listeners join the
+/// running queue.
+pub async fn stream_handler(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let mut rx = state.radio.tx.subscribe();
+    state.radio.listeners.fetch_add(1, Ordering::SeqCst);
+    spawn_engine(&state, &params);
+
+    let icy = headers
+        .get("Icy-MetaData")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let now = state.radio.now.clone();
+    let listeners = state.radio.listeners.clone();
+
+    let body = Body::from_stream(async_stream::stream! {
+        let _guard = ListenerGuard(listeners);
+        let mut pending: Vec<u8> = Vec::with_capacity(METAINT + 256);
+        loop {
+            match rx.recv().await {
+                Ok(chunk) => {
+                    pending.extend_from_slice(&chunk);
+                    let mut out = Vec::new();
+                    while pending.len() >= METAINT {
+                        let frame: Vec<u8> = pending.drain(..METAINT).collect();
+                        out.extend_from_slice(&frame);
+                        if icy {
+                            out.extend(meta_block(&now));
+                        }
+                    }
+                    if !out.is_empty() {
+                        yield Ok::<_, std::convert::Infallible>(out);
+                    }
+                }
+                // Too slow: drop what we missed, keep the stream live.
+                Err(broadcast::error::RecvError::Lagged(_)) => pending.clear(),
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "audio/ogg")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("icy-name", HeaderValue::from_static("sonoteka"))
+        .header("icy-genre", HeaderValue::from_static("various"));
+    if icy {
+        builder = builder.header("icy-metaint", METAINT.to_string());
+    }
+    match builder.body(body) {
+        Ok(resp) => resp.into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("radio stream build failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// One engine at a time; concurrent requests just join the broadcast.
+fn spawn_engine(state: &AppState, params: &HashMap<String, String>) {
+    if state.radio.engine_on.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let state = state.clone();
+    let rules = rules_from_params(params);
+    tokio::spawn(async move {
+        run_radio(&state, rules).await;
+        state.radio.engine_on.store(false, Ordering::SeqCst);
+    });
+}
+
+fn rules_from_params(params: &HashMap<String, String>) -> Rules {
+    let genres = params
+        .get("genres")
+        .map(|g| {
+            g.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let order = match params.get("order").map(String::as_str) {
+        Some("newest") => Order::Newest,
+        Some("top") => Order::Top,
+        _ => Order::Random,
+    };
+    Rules {
+        genres,
+        limit: params
+            .get("limit")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
+            .clamp(1, 500),
+        order,
+        exclude_recent_days: params
+            .get("exclude_recent_days")
+            .and_then(|v| v.parse().ok())
+            .or(Some(1)),
+        ..Rules::default()
+    }
+}
+
+async fn run_radio(state: &AppState, rules: Rules) {
+    loop {
+        if state.radio.listeners.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let now = now_secs();
+        let tracks = {
+            let conn = match state.db.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[radio] db lock poisoned: {e}");
+                    return;
+                }
+            };
+            match tracks_by_rules(&conn, &rules, now) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[radio] rules query failed: {e:#}");
+                    Vec::new()
+                }
+            }
+        };
+        if tracks.is_empty() {
+            eprintln!("[radio] no tracks match, retrying in 10s");
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            continue;
+        }
+        for track in &tracks {
+            if state.radio.listeners.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            if let Ok(mut np) = state.radio.now.lock() {
+                np.title = track.title.clone();
+                np.artist = track.artist_name.clone();
+            }
+            eprintln!("[radio] {} — {}", track.artist_name, track.title);
+            if let Err(e) = pump_track(state, track).await {
+                eprintln!("[radio] {}: {e:#}", track.path);
+            }
+        }
+    }
+}
+
+/// Transcode one track to Opus-in-Ogg and broadcast ffmpeg's stdout.
+async fn pump_track(state: &AppState, track: &db::TrackRow) -> Result<()> {
+    let ffmpeg = std::env::var("SONOTEKA_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let mut child = tokio::process::Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            // pace the input at native speed so the stream is realtime
+            "-re",
+            "-i",
+            &track.path,
+            "-vn",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96k",
+            "-f",
+            "ogg",
+            "pipe:1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn ffmpeg")?;
+    let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = stdout.read(&mut buf).await.context("read ffmpeg stdout")?;
+        if n == 0 {
+            break;
+        }
+        if state.radio.tx.send(buf[..n].to_vec()).is_err() {
+            // Nobody is listening; kill early, the engine loop will exit.
+            let _ = child.kill().await;
+            break;
+        }
+    }
+    child.wait().await.context("ffmpeg wait")?;
+    Ok(())
+}
+
+/// ICY metadata block: 1-byte length (in 16-byte units) + payload padded to
+/// a 16-byte boundary.
+fn meta_block(now: &Arc<StdMutex<NowPlaying>>) -> Vec<u8> {
+    let np = now
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| NowPlaying::default());
+    let clean = |s: &str| s.replace('\'', "");
+    let payload = format!("StreamTitle='{} - {}';", clean(&np.artist), clean(&np.title));
+    let mut block = payload.into_bytes();
+    let units = block.len() / 16 + 1;
+    block.resize(units * 16, 0);
+    let mut out = vec![units as u8];
+    out.extend_from_slice(&block);
+    out
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

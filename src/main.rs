@@ -19,6 +19,7 @@ pub struct AppState {
     pub user: String,
     pub password: String,
     pub scanning: Arc<std::sync::atomic::AtomicBool>,
+    pub radio: radio::RadioState,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
         user,
         password,
         scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        radio: radio::RadioState::new(),
     };
 
     let addr: SocketAddr = format!("{address}:{port}")
