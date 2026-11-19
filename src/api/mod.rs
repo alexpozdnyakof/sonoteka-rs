@@ -119,9 +119,8 @@ async fn dispatch(
             "artistInfo2": { "biography": "", "musicBrainzId": "", "lastFmUrl": "", "album": [] }
         })),
         "getCoverArt" => crate::stream::cover_art(state, &params).await,
-        "stream" | "download" => {
-            crate::stream::stream(state, &params, range).await
-        }
+        "stream" => crate::stream::stream(state, &params, range, true).await,
+        "download" => crate::stream::stream(state, &params, range, false).await,
         "scrobble" => subsonic::scrobble(&state, &params, &multi),
         other => {
             eprintln!("[req] {other} -> not implemented");

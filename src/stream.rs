@@ -23,6 +23,7 @@ pub async fn stream(
     state: AppState,
     params: &HashMap<String, String>,
     range: Option<&str>,
+    allow_transcode: bool,
 ) -> Response {
     let Some(id) = params.get("id") else {
         return subsonic::error(10, "missing required parameter: id");
@@ -32,7 +33,98 @@ pub async fn stream(
         Ok(None) => return subsonic::error(70, &format!("song not found: {id}")),
         Err(e) => return subsonic::error(0, &format!("database error: {e:#}")),
     };
+    if allow_transcode {
+        if let Some(target) = transcode_target(&track, params) {
+            return transcode(&track, target).await;
+        }
+    }
     serve_file(Path::new(&track.path), &track.content_type, range).await
+}
+
+/// What the client asked for vs what the file already is. Subsonic clients
+/// signal transcoding through `format` (explicit) or `maxBitRate` (then we
+/// pick Opus for lossless sources).
+enum TranscodeTarget {
+    Opus(u32),
+    Mp3(u32),
+}
+
+fn transcode_target(track: &db::TrackRow, params: &HashMap<String, String>) -> Option<TranscodeTarget> {
+    let max_br = params
+        .get("maxBitRate")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&b| b > 0);
+    match params.get("format").map(String::as_str) {
+        Some("opus") if track.suffix != "opus" => Some(TranscodeTarget::Opus(
+            max_br.unwrap_or(96).clamp(32, 256),
+        )),
+        Some("mp3") if track.suffix != "mp3" => Some(TranscodeTarget::Mp3(
+            max_br.unwrap_or(192).clamp(32, 320),
+        )),
+        Some(_) => None,
+        None => {
+            let lossless = matches!(track.suffix.as_str(), "flac" | "wav");
+            match (max_br, lossless) {
+                (Some(b), true) => Some(TranscodeTarget::Opus(b.clamp(32, 256))),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// On-the-fly ffmpeg transcode; the response is a plain chunked stream with
+/// no Range support (Subsonic clients only seek on direct-file streams).
+async fn transcode(track: &db::TrackRow, target: TranscodeTarget) -> Response {
+    let (encoder, bitrate, muxer, content_type) = match target {
+        TranscodeTarget::Opus(k) => ("libopus", k, "ogg", "audio/ogg"),
+        TranscodeTarget::Mp3(k) => ("libmp3lame", k, "mp3", "audio/mpeg"),
+    };
+    let ffmpeg = std::env::var("SONOTEKA_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let child = tokio::process::Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-re",
+            "-i",
+            &track.path,
+            "-vn",
+            "-c:a",
+            encoder,
+            "-b:a",
+            &format!("{bitrate}k"),
+            "-f",
+            muxer,
+            "pipe:1",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return subsonic::error(0, &format!("cannot spawn ffmpeg for {}: {e}", track.path))
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill().await;
+            return subsonic::error(0, "ffmpeg stdout unavailable");
+        }
+    };
+    // Reap the process once the stream ends (stdout closing means it exited).
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "none")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(ReaderStream::new(stdout)))
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| subsonic::error(0, &format!("transcode response failed: {e}")))
 }
 
 pub async fn cover_art(state: AppState, params: &HashMap<String, String>) -> Response {
