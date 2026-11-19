@@ -8,7 +8,9 @@ echo "==> build ($TARGET)"
 cargo build --release --target "$TARGET"
 
 echo "==> scp to macbookpro"
-scp -q "target/$TARGET/release/sonoteka-rs" macbookpro:sonoteka/
+# The launchd job runs a stable launcher binary (sonoteka-rs-launcher) so
+# macOS TCC grants survive rebuilds; the real binary it execs is replaced.
+scp -q "target/$TARGET/release/sonoteka-rs" macbookpro:sonoteka/sonoteka-server
 
 echo "==> restart service"
 ssh macbookpro 'UID_NUM=$(id -u)
@@ -24,4 +26,4 @@ ssh macbookpro 'UID_NUM=$(id -u)
         fi
     done
     tail -2 "$LOG"
-    pgrep -x sonoteka-rs >/dev/null && echo "deploy: OK" || { echo "deploy: FAIL"; exit 1; }'
+    lsof -nP -iTCP:4533 -sTCP:LISTEN >/dev/null 2>&1 && echo "deploy: OK" || { echo "deploy: FAIL"; exit 1; }'
