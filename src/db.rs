@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    conn.create_collation("NATURAL", natural_cmp)?;
     conn.execute_batch(
         r"
         CREATE TABLE IF NOT EXISTS artists (
@@ -64,6 +65,71 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     )?;
     migrate(conn)?;
     Ok(())
+}
+
+/// Case-insensitive natural ordering: digit runs compare numerically, so
+/// "768 ..." sorts between "767 x" and "769 y" instead of floating up next
+/// to the digits' byte values. Registered as the NATURAL collation.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    enum Run {
+        Digits(String),
+        Char(char),
+    }
+
+    fn next_run(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Run> {
+        match it.peek().copied() {
+            Some(c) if c.is_ascii_digit() => {
+                let mut s = String::new();
+                while let Some(&c) = it.peek() {
+                    if c.is_ascii_digit() {
+                        s.push(c);
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                Some(Run::Digits(s))
+            }
+            Some(c) => {
+                it.next();
+                Some(Run::Char(c.to_ascii_lowercase()))
+            }
+            None => None,
+        }
+    }
+
+    let mut ra = a.chars().peekable();
+    let mut rb = b.chars().peekable();
+    loop {
+        match (next_run(&mut ra), next_run(&mut rb)) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(Run::Digits(x)), Some(Run::Digits(y))) => {
+                let (tx, ty) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                let ord = tx.len().cmp(&ty.len()).then_with(|| tx.cmp(ty));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                // Numerically equal ("007" vs "7"): fewer leading zeros first.
+                if x.len() != y.len() {
+                    return x.len().cmp(&y.len());
+                }
+            }
+            (Some(Run::Char(x)), Some(Run::Char(y))) => {
+                let ord = x.cmp(&y);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            // Digit-led titles after letters: an A-Z listing should start
+            // with A, not with "768 ..." (the plan's original complaint).
+            (Some(Run::Digits(_)), Some(Run::Char(_))) => return Ordering::Greater,
+            (Some(Run::Char(_)), Some(Run::Digits(_))) => return Ordering::Less,
+        }
+    }
 }
 
 /// Additive migrations for databases created by older builds: tracks.genre
@@ -201,7 +267,7 @@ pub fn artists_index(conn: &Connection) -> Result<Vec<ArtistRow>> {
         "SELECT a.id, a.name,
                 (SELECT COUNT(*) FROM albums al WHERE al.artist_id = a.id) AS album_count
          FROM artists a
-         ORDER BY a.name COLLATE NOCASE",
+         ORDER BY a.name COLLATE `NATURAL`",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -257,10 +323,10 @@ pub fn list_albums(
     offset: i64,
 ) -> Result<Vec<AlbumRow>> {
     let order = match sort {
-        AlbumSort::Newest => "al.added_at DESC, al.name COLLATE NOCASE",
+        AlbumSort::Newest => "al.added_at DESC, al.name COLLATE `NATURAL`",
         AlbumSort::Random => "RANDOM()",
-        AlbumSort::ByArtist => "ar.name COLLATE NOCASE, al.name COLLATE NOCASE",
-        AlbumSort::ByName => "al.name COLLATE NOCASE",
+        AlbumSort::ByArtist => "ar.name COLLATE `NATURAL`, al.name COLLATE `NATURAL`",
+        AlbumSort::ByName => "al.name COLLATE `NATURAL`",
     };
     let sql = format!("{ALBUM_SELECT} ORDER BY {order} LIMIT ?1 OFFSET ?2");
     let mut stmt = conn.prepare(&sql)?;
@@ -383,7 +449,7 @@ pub fn get_artist(conn: &Connection, id: &str) -> Result<Option<ArtistRow>> {
 }
 
 pub fn albums_for_artist(conn: &Connection, artist_id: &str) -> Result<Vec<AlbumRow>> {
-    let sql = format!("{ALBUM_SELECT} WHERE al.artist_id = ?1 ORDER BY al.name COLLATE NOCASE");
+    let sql = format!("{ALBUM_SELECT} WHERE al.artist_id = ?1 ORDER BY al.name COLLATE `NATURAL`");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![artist_id], album_from_row)?
@@ -403,7 +469,7 @@ pub fn search_artists(
                 (SELECT COUNT(*) FROM albums al WHERE al.artist_id = a.id) AS album_count
          FROM artists a
          WHERE a.name LIKE ?1 
-         ORDER BY a.name COLLATE NOCASE
+         ORDER BY a.name COLLATE `NATURAL`
          LIMIT ?2 OFFSET ?3",
     )?;
     let rows = stmt
@@ -423,7 +489,7 @@ pub fn search_albums(conn: &Connection, query: &str, size: i64, offset: i64) -> 
     let sql = format!(
         "{ALBUM_SELECT}
          WHERE al.name LIKE ?1  OR ar.name LIKE ?1 
-         ORDER BY al.name COLLATE NOCASE
+         ORDER BY al.name COLLATE `NATURAL`
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -438,7 +504,7 @@ pub fn search_tracks(conn: &Connection, query: &str, size: i64, offset: i64) -> 
     let sql = format!(
         "{TRACK_SELECT}
          WHERE t.title LIKE ?1  OR al.name LIKE ?1  OR ar.name LIKE ?1 
-         ORDER BY ar.name COLLATE NOCASE, al.name COLLATE NOCASE, t.path
+         ORDER BY ar.name COLLATE `NATURAL`, al.name COLLATE `NATURAL`, t.path
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -458,7 +524,7 @@ pub fn songs_by_artist(conn: &Connection, artist_id: &str, limit: i64) -> Result
     let sql = format!(
         "{TRACK_SELECT} WHERE t.artist_id = ?1
          ORDER BY t.play_count DESC, COALESCE(t.played_at, 0) DESC,
-                  al.name COLLATE NOCASE, t.path LIMIT ?2"
+                  al.name COLLATE `NATURAL`, t.path LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -492,7 +558,7 @@ pub fn list_genres(conn: &Connection) -> Result<Vec<GenreRow>> {
          FROM tracks
          WHERE genre IS NOT NULL AND genre != ''
          GROUP BY genre
-         ORDER BY song_count DESC, genre COLLATE NOCASE",
+         ORDER BY song_count DESC, genre COLLATE `NATURAL`",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -514,7 +580,7 @@ pub fn songs_by_genre(
 ) -> Result<Vec<TrackRow>> {
     let sql = format!(
         "{TRACK_SELECT} WHERE t.genre = ?1
-         ORDER BY ar.name COLLATE NOCASE, al.name COLLATE NOCASE, t.path
+         ORDER BY ar.name COLLATE `NATURAL`, al.name COLLATE `NATURAL`, t.path
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -535,7 +601,7 @@ pub fn albums_by_genre(
         "{ALBUM_SELECT}
          WHERE EXISTS (SELECT 1 FROM tracks t
                        WHERE t.album_id = al.id AND t.genre = ?1)
-         ORDER BY ar.name COLLATE NOCASE, al.name COLLATE NOCASE
+         ORDER BY ar.name COLLATE `NATURAL`, al.name COLLATE `NATURAL`
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -608,7 +674,7 @@ fn playlist_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistRow> {
 }
 
 pub fn list_playlists(conn: &Connection) -> Result<Vec<PlaylistRow>> {
-    let sql = format!("{PLAYLIST_SELECT} GROUP BY p.id ORDER BY p.name COLLATE NOCASE");
+    let sql = format!("{PLAYLIST_SELECT} GROUP BY p.id ORDER BY p.name COLLATE `NATURAL`");
     let mut stmt = conn.prepare(&sql)?;
     Ok(stmt
         .query_map([], playlist_from_row)?

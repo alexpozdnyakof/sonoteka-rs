@@ -194,7 +194,7 @@ fn index_file(conn: &mut Connection, path: &Path, ext: &str, now: i64) -> Result
     let year = tag.and_then(|t| t.date()).map(|d| d.year as u32);
     let track_number = tag.and_then(|t| t.track());
     let disc_number = tag.and_then(|t| t.disk());
-    let genre = tag_string(tag, |t| t.genre());
+    let genre = tag_string(tag, |t| t.genre()).map(|g| normalize_genre(&g));
     let has_art = tag.map(|t| !t.pictures().is_empty()).unwrap_or(false);
 
     let duration_secs = props.duration().as_secs_f64();
@@ -229,6 +229,18 @@ fn index_file(conn: &mut Connection, path: &Path, ext: &str, now: i64) -> Result
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Tags carry inconsistent genre casing ("Electronic"/"electronic",
+/// "Electro"/"electro") which splits one genre into several. Canonical
+/// form: first character upper-cased, rest untouched.
+fn normalize_genre(g: &str) -> String {
+    let trimmed = g.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn tag_string<F>(tag: Option<&lofty::tag::Tag>, f: F) -> Option<String>
