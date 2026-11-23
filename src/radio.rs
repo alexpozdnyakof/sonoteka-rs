@@ -313,7 +313,7 @@ async fn run_radio(state: &AppState, rules: Rules) {
             return;
         }
         let now = now_secs();
-        let tracks = {
+        let batch = {
             let conn = match state.db.lock() {
                 Ok(c) => c,
                 Err(e) => {
@@ -329,29 +329,76 @@ async fn run_radio(state: &AppState, rules: Rules) {
                 }
             }
         };
-        if tracks.is_empty() {
+        if batch.is_empty() {
             eprintln!("[radio] no tracks match, retrying in 10s");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             continue;
         }
-        for track in &tracks {
-            if state.radio.listeners.load(Ordering::Relaxed) == 0 {
-                return;
-            }
-            if let Ok(mut np) = state.radio.now.lock() {
-                np.title = track.title.clone();
-                np.artist = track.artist_name.clone();
-            }
-            eprintln!("[radio] {} — {}", track.artist_name, track.title);
-            if let Err(e) = pump_track(state, track).await {
-                eprintln!("[radio] {}: {e:#}", track.path);
-            }
+        eprintln!(
+            "[radio] batch: {} track(s), {:.0} min",
+            batch.len(),
+            batch.iter().map(|t| t.duration).sum::<f64>() / 60.0,
+        );
+        if let Err(e) = pump_batch(state, &batch).await {
+            eprintln!("[radio] batch failed: {e:#}");
         }
     }
 }
 
-/// Transcode one track to Opus-in-Ogg and broadcast ffmpeg's stdout.
-async fn pump_track(state: &AppState, track: &db::TrackRow) -> Result<()> {
+/// One continuous ffmpeg process per batch: the concat demuxer stitches the
+/// queue into a single encode, so track transitions are sample-continuous
+/// (Opus has no encoder priming, Ogg just keeps paging). NowPlaying is
+/// driven by a timer over the tag durations — drift of a few tens of ms
+/// per boundary is fine for display.
+async fn pump_batch(state: &AppState, batch: &[db::TrackRow]) -> Result<()> {
+    let list_path = write_concat_list(batch)?;
+    let meta = tokio::spawn(now_playing_timer(
+        state.radio.now.clone(),
+        batch
+            .iter()
+            .map(|t| (t.artist_name.clone(), t.title.clone(), t.duration))
+            .collect(),
+    ));
+    let result = pump_concat(state, &list_path).await;
+    meta.abort();
+    let _ = std::fs::remove_file(&list_path);
+    result
+}
+
+async fn now_playing_timer(
+    slot: Arc<StdMutex<NowPlaying>>,
+    tracks: Vec<(String, String, f64)>,
+) {
+    for (artist, title, duration) in tracks {
+        if let Ok(mut np) = slot.lock() {
+            np.artist = artist.clone();
+            np.title = title.clone();
+        }
+        eprintln!("[radio] {artist} — {title}");
+        tokio::time::sleep(std::time::Duration::from_secs_f64(duration.max(0.0))).await;
+    }
+}
+
+/// ffconcat list v1.0; single quotes in paths are escaped for the demuxer.
+fn write_concat_list(batch: &[db::TrackRow]) -> Result<std::path::PathBuf> {
+    use std::fmt::Write as _;
+    let mut text = String::from("ffconcat version 1.0\n");
+    for t in batch {
+        let escaped = t.path.replace('\'', "'\\''");
+        let _ = writeln!(text, "file '{escaped}'");
+    }
+    let path = std::env::temp_dir().join(format!(
+        "sonoteka-radio-{}-{now_secs}.txt",
+        std::process::id(),
+        now_secs = now_secs()
+    ));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// Transcode the whole concat list as one Opus-in-Ogg stream and broadcast
+/// ffmpeg's stdout.
+async fn pump_concat(state: &AppState, list_path: &std::path::Path) -> Result<()> {
     let ffmpeg = std::env::var("SONOTEKA_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     let mut child = tokio::process::Command::new(ffmpeg)
         .args([
@@ -359,10 +406,13 @@ async fn pump_track(state: &AppState, track: &db::TrackRow) -> Result<()> {
             "-loglevel",
             "error",
             "-nostdin",
-            // pace the input at native speed so the stream is realtime
             "-re",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
             "-i",
-            &track.path,
+            &list_path.to_string_lossy(),
             "-vn",
             "-c:a",
             "libopus",
@@ -377,6 +427,7 @@ async fn pump_track(state: &AppState, track: &db::TrackRow) -> Result<()> {
         .context("spawn ffmpeg")?;
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
     let mut buf = vec![0u8; 16 * 1024];
+    let mut listener_gone = false;
     loop {
         let n = stdout.read(&mut buf).await.context("read ffmpeg stdout")?;
         if n == 0 {
@@ -385,10 +436,17 @@ async fn pump_track(state: &AppState, track: &db::TrackRow) -> Result<()> {
         if state.radio.tx.send(buf[..n].to_vec()).is_err() {
             // Nobody is listening; kill early, the engine loop will exit.
             let _ = child.kill().await;
+            listener_gone = true;
             break;
         }
     }
-    child.wait().await.context("ffmpeg wait")?;
+    let status = child.wait().await.context("ffmpeg wait")?;
+    if listener_gone {
+        return Ok(());
+    }
+    if !status.success() {
+        anyhow::bail!("ffmpeg exited with {status}");
+    }
     Ok(())
 }
 
