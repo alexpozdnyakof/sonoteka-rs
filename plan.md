@@ -3,7 +3,7 @@
 ## Контекст стенда (чтобы не вспоминать)
 
 - Сервер: MacBook Pro (Intel, macOS 15.7.3), `~/sonoteka/`, launchd-агент `ru.sonoteka.rs`, лог `~/sonoteka/server.log`.
-- Библиотека: `/Volumes/Macintosh HD 1/music` — 413 треков / 57 альбомов, внешний HDD.
+- Библиотека: `/Volumes/Macintosh HD 1/music` — 563 трека / 67 альбомов, внешний HDD.
 - Деплой с MBA: `./deploy.sh` (кросс-сборка x86_64 → scp → launchctl kickstart → ждёт свежий `listening`).
 - Доступ клиентов: дома — LAN `http://192.168.88.137:4533` (быстро), вне дома — меш `http://100.64.0.5:4533`.
 - Auth: пользователь `admin`, пароль в `~/sonoteka/sonoteka.env`.
@@ -25,27 +25,26 @@
 - [x] **Умные плейлисты**: rules в колонке playlists.rules, автообновление при скане и при смене правил
 - [x] **Эфир** `/radio`: общая очередь → broadcast, ffmpeg `-re` (realtime) в Opus 96k Ogg; ICY StreamTitle только по `Icy-MetaData: 1`, иначе чистый Ogg. Параметры очереди `?genres=..&order=..&limit=..&exclude_recent_days=..`. ffmpeg 6.1.1 статикой в `~/sonoteka/ffmpeg`, путь через `SONOTEKA_FFMPEG`
 - [x] **TCC-лаунчер**: стабильный бинарь `sonoteka-rs-launcher` (не меняется между деплоями) exec'ит `sonoteka-server` — разрешение «Съёмные тома» выдано один раз и переживает редеплои
+- [x] **Натуральная сортировка**: коллация `NATURAL` в rusqlite (цифровые блоки сравниваются численно), `768 ...` больше не всплывает наверх
+- [x] **Нормализация жанров**: регистр при скане (первая буква заглавная), дубликаты схлопнулись
+- [x] **Транскодинг в /stream**: `format=opus|mp3` и `maxBitRate` (для lossless); mp3-источник отдаётся как есть, `download` — всегда оригинал, Range на прямых потоках жив
+- [x] **Snapshot-тесты** (insta): child/album/playlist/envelope — регрессии конвертов ловятся сами
+- [x] **Gapless-эфир**: батч кодируется одним ffmpeg через concat-лист — стыки sample-continuous (один OpusHead на батч), NowPlaying ведётся таймером по длительностям тегов
 
 ## Фаза 2 — радио (остаток)
 
 - [ ] InternetRadioStations CRUD (закладки на внешние станции) — низкий приоритет
-- [ ] Gapless между треками в эфире (ffmpeg acrossfile — сейчас маленькая пауза на стыках)
 
 ## Фаза 3 — совместимость и качество
 
 - [ ] XML-конверт ответов (legacy-клиенты без JSON)
 - [ ] apiKey auth + constant-time сравнение токенов
-- [ ] Snapshot-тесты конвертов (insta) — регрессии ловятся сами
 - [ ] Identity ledger: ID не портятся при ретеге/переносе (долговечность плейлистов)
 - [ ] Мульти-библиотека: несколько `SONOTEKA_MUSIC_FOLDER`
-- [ ] Сортировка: `768 ...` сейчас всплывает наверх — натуральная сортировка для цифровых префиксов
-- [ ] Нормализация регистра жанров: `Electronic`/`electronic`/`Electro`/`electro` сейчас разные строки (17 жанров вместо ~10)
 
 ## Фаза 4 — расширения
 
-- [ ] Транскодинг ffmpeg (Opus для мобильного интернета)
 - [ ] Скробблинг наружу: ListenBrainz / Last.fm
-- [ ] Gapless/кроссфейд в эфире (ffmpeg acrossfile)
 
 ## Внешние блокеры
 
