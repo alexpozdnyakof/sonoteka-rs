@@ -33,10 +33,10 @@ pub async fn stream(
         Ok(None) => return subsonic::error(70, &format!("song not found: {id}")),
         Err(e) => return subsonic::error(0, &format!("database error: {e:#}")),
     };
-    if allow_transcode {
-        if let Some(target) = transcode_target(&track, params) {
-            return transcode(&track, target).await;
-        }
+    if allow_transcode
+        && let Some(target) = transcode_target(&track, params)
+    {
+        return transcode(&track, target).await;
     }
     serve_file(Path::new(&track.path), &track.content_type, range).await
 }
